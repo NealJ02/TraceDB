@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} / sanitize=${{ matrix.sanitize }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false  # report every combination, not just the first failure
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        sanitize: ["OFF", "ON"]
+
+    env:
+      UBSAN_OPTIONS: print_stacktrace=1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DTRACEDB_SANITIZE=${{ matrix.sanitize }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
