@@ -6,7 +6,9 @@ An embedded storage engine for distributed-tracing data, written from scratch in
 
 TraceDB is a log-structured merge (LSM) tree specialized for spans: data that is written roughly in time order, almost never updated, queried by time range and tags, and expired in bulk by age. It is a library, not a server, and depends on no other database or storage library.
 
-> **Status:** early development. The project skeleton (build, tests, sanitizers, CI) is in place; the storage engine is not yet implemented.
+> **Status:** early development. The project skeleton (build, tests, sanitizers, CI) and the on-disk span encoding are in place; the storage engine is not yet implemented.
+
+The full specification is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Building and testing
 
@@ -32,4 +34,5 @@ ctest --test-dir build-asan --output-on-failure
 include/tracedb/   public headers
 src/               implementation
 tests/unit/        unit tests (GoogleTest)
+docs/              design specification
 ```
