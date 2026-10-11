@@ -28,6 +28,7 @@ set(TRACEDB_WARNINGS -Wall -Wextra -Wpedantic -Wshadow)
 add_library(tracedb
   src/status.cc
   src/util/coding.cc
+  src/span_codec.cc
 )
 target_include_directories(tracedb
   PUBLIC  ${PROJECT_SOURCE_DIR}/include
@@ -48,6 +49,7 @@ enable_testing()
 add_executable(tracedb_tests
   tests/unit/status_test.cc
   tests/unit/coding_test.cc
+  tests/unit/span_codec_test.cc
 )
 target_include_directories(tracedb_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(tracedb_tests PRIVATE tracedb GTest::gtest_main)
