@@ -29,6 +29,8 @@ add_library(tracedb
   src/status.cc
   src/util/coding.cc
   src/span_codec.cc
+  src/memtable/memtable.cc
+  src/db_impl.cc
 )
 target_include_directories(tracedb
   PUBLIC  ${PROJECT_SOURCE_DIR}/include
@@ -50,6 +52,9 @@ add_executable(tracedb_tests
   tests/unit/status_test.cc
   tests/unit/coding_test.cc
   tests/unit/span_codec_test.cc
+  tests/unit/memtable_test.cc
+  tests/unit/db_test.cc
+  tests/differential/differential_test.cc
 )
 target_include_directories(tracedb_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(tracedb_tests PRIVATE tracedb GTest::gtest_main)

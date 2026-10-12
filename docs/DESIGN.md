@@ -1,6 +1,6 @@
 # TraceDB: An Embedded Storage Engine for Time-Series Trace Data
 
-**Specification, v0.2**
+**Specification, v0.3**
 **Author:** Neal Jain
 **Status:** Draft. Sections marked *(implemented)* match the code.
 
@@ -130,6 +130,8 @@ Worked example: a span with `parent_id = 0`, `duration_ns = 1,250,000,000`, `nam
 
 ## 4. Public API (C++20)
 
+The complete target API is below. Methods and options are added to the real headers in the step that implements them; [4.2](#42-interface-and-implementation-implemented-includetracedbdbh-srcdb_implh) lists what exists now.
+
 ```cpp
 struct Options {
   size_t   memtable_size_bytes   = 4 << 20;  // flush threshold (4 MiB)
@@ -181,6 +183,17 @@ Errors are returned, never thrown.
 | `kInvalidArgument` | The caller passed bad input |
 | `kNotFound` | Something that should exist does not (e.g. a file listed in the MANIFEST). **Not** used for a missing key. |
 
+### 4.2 Interface and implementation *(implemented: `include/tracedb/db.h`, `src/db_impl.h`)*
+
+- **`TraceDB` is an abstract interface.** Every method is pure virtual; the implementation is a private class, `DBImpl final : public TraceDB`, in `src/`. The public header therefore exposes no internals (memtable, WAL, file lists), and internals can change without recompiling users' code. This is the pattern LevelDB and RocksDB use.
+- **`Open` is a static factory**, because a constructor cannot return an error. It is declared in `db.h` but defined in `db_impl.cc`, since it must create a `DBImpl`. It returns `Result<std::unique_ptr<TraceDB>>`: the caller owns the database, which is destroyed when the `unique_ptr` goes out of scope.
+- **`Open` validates its arguments:** an empty `dir`, or `memtable_size_bytes == 0`, fails with `kInvalidArgument`.
+- **A database handle cannot be copied** (deleted copy operations), and the destructor is virtual so deleting through a `TraceDB*` runs `DBImpl`'s destructor.
+- **`Close`** may be called more than once. After it, `Put` and `Get` fail with `kInvalidArgument`.
+- **Not thread-safe** in v1 ([Section 9](#9-concurrency-model)).
+
+Currently implemented: `Open`, `Put`, `Get`, `Close`, and `Options::memtable_size_bytes`. All data lives in memory; nothing is read from or written to `dir` until the WAL exists.
+
 ---
 
 ## 5. Architecture
@@ -215,6 +228,8 @@ Errors are returned, never thrown.
 2. Append the record to the WAL; fsync according to `sync_mode`.
 3. Insert into the memtable.
 4. If the memtable exceeds `memtable_size_bytes`, flush ([5.4](#54-flush)).
+
+Sequence numbers start at 1; 0 never belongs to a real write. Currently implemented: steps 1 and 3 (in `DBImpl::Put`). The WAL (step 2) comes next; flushing (step 4) comes with SSTables.
 
 ### 5.2 Read path (`Get`)
 
@@ -257,6 +272,16 @@ A crash at any step must be safe: before step 4 completes, the old WAL still exi
 2. Delete any SSTable files not referenced by the manifest (orphans).
 3. Replay WAL file(s) into a fresh memtable. Stop at the first record with an invalid checksum or truncated length: a torn final write is expected after a crash and is discarded. A bad record that is **not** at the tail is reported as `kCorruption`.
 4. Restore the next sequence number as `max(seen) + 1`.
+
+### 5.7 Memtable *(implemented: `src/memtable/memtable.h`)*
+
+- **Structure:** `std::map<std::string, Entry, std::less<>>`, a red-black tree. It must be a *balanced* tree: keys arrive nearly in time order, which would degrade an unbalanced BST into a linked list. The `std::map` is hidden inside a `Memtable` class, so it can be replaced (e.g. by a skip list for v2) without changing callers.
+- **Stores encoded bytes**, not `Span` structs: the key is the 32-byte encoded key, and `Entry` is `{seq, encoded value}`. So entries sort exactly as they will on disk, memory usage is easy to measure, and a flush can copy entries straight into an SSTable. The cost is a decode on every `Get`.
+- **One version per key.** A second `Put` to a key replaces the entry. Older versions would only matter for snapshots or transactions, which v1 does not have. The `seq` is kept because, once SSTables exist, it decides which copy of a key is newest. `Insert` asserts that a replacement's `seq` is greater than the old one's.
+- **`std::less<>`** (a transparent comparator) lets lookups take a `std::string_view` without building a temporary `std::string`.
+- **`Get` returns a view** into the memtable's storage, valid only until the memtable is next modified. `DBImpl::Get` decodes it immediately.
+- **Memory accounting:** `ApproximateMemoryUsage()` = key bytes + value bytes + a fixed per-entry estimate of tree-node, string-object and allocator overhead (~120 bytes on 64-bit Linux), adjusted exactly on overwrite. It is an estimate because node layouts and allocator overhead vary by platform; it only needs to be close enough to decide when to flush. It is tracked now and enforced once flushing exists.
+- **Non-copyable**, since a memtable can hold megabytes.
 
 ---
 
@@ -355,13 +380,22 @@ Correctness is the central goal of this project. Testing gets as much effort as 
 - SSTable build/read, block boundaries, index search.
 - Merging iterator with duplicates across sources.
 
-### 8.2 Differential (model-based) testing
+### 8.2 Differential (model-based) testing *(implemented for `Put`/`Get`: `tests/differential/differential_test.cc`)*
 
 - Run thousands of random operations (`Put`, `Get`, `Scan`, `Flush`, `CompactAll`, `DropBefore`, reopen) against both TraceDB and a reference model (`std::map<SpanKey, Span>`).
 - After every operation, check that the results agree exactly.
 - Draw keys from a small key space so that overwrites and successful lookups are frequent.
 - Use a seeded RNG so any failure is reproducible from its seed.
 - The harness is built first, with only `Put`/`Get`, and each later feature adds its operations to it.
+
+As built:
+
+- **Key pools:** 52 timestamps (including 0 and `UINT64_MAX`) × 4 trace IDs (including all-`00`, all-`ff`, and two differing only in the last byte) × 4 span IDs = 832 keys.
+- **Spans:** random names, parent IDs, durations (occasionally `UINT64_MAX`), 0-3 tags, and random-byte payloads (70% 0-200 B, 25% 200 B-4 KB, 5% 20 KiB).
+- **Operations:** 50% `Put`, 30% `Get` of a written key, 20% `Get` of any pool key. After the run, every pool key is checked.
+- **Runs:** 10 seeds × 5,000 operations. `TRACEDB_SEED=<n>` replays one seed; every failure reports its seed and operation number.
+- **Same on every platform:** only `std::mt19937_64`'s raw output (fully specified by the standard) and `%` are used, never `std::uniform_int_distribution`, whose output differs between standard libraries.
+- **Self-check:** each run must produce at least one overwrite, one hit and one miss, so the test cannot quietly stop exercising them.
 
 ### 8.3 Crash testing
 
@@ -420,7 +454,7 @@ Every result goes in the README with an explanation of *why* TraceDB wins or los
 | Milestone | Timing             | Deliverable | Status |
 |-----------|--------------------|-------------|--------|
 | **M0**    | Winter break 2026  | Finalize this spec. Set up repo, CMake, GoogleTest, sanitizers, CI. Implement encoding and `Status`/`Result` types. | Done |
-| **M1**    | Weeks 1–2          | WAL + memtable + recovery. `Put`/`Get` work in memory with a crash-safe WAL. Differential test harness running from day one. | Next |
+| **M1**    | Weeks 1–2          | WAL + memtable + recovery. `Put`/`Get` work in memory with a crash-safe WAL. Differential test harness running from day one. | In progress: memtable, in-memory `Put`/`Get`, and differential harness done; WAL and recovery next |
 | **M2**    | Weeks 3–4          | SSTables + flush + manifest. Data persists across restarts. `Get` reads across sources. | |
 | **M3**    | Weeks 5–6          | `Scan` + merging iterator + tag filters. Time-range pruning via manifest min/max timestamps. | |
 | **M4**    | Weeks 7–8          | Compaction + `DropBefore`. Crash tests and fault-injection tests passing. | |
@@ -439,13 +473,15 @@ tracedb/
   include/tracedb/      # public headers
     status.h            #   Status, Result<T>          (implemented)
     span.h              #   Span, SpanKey, TraceId     (implemented)
-    db.h, options.h     #   planned
+    db.h                #   TraceDB interface          (implemented)
+    options.h           #   Options                    (implemented)
   src/
     status.cc           # (implemented)
     span_codec.{h,cc}   # key/value encoding           (implemented)
     util/coding.{h,cc}  # fixed/varint/length-prefixed (implemented)
+    db_impl.{h,cc}      # DBImpl, TraceDB::Open        (implemented)
+    memtable/           # Memtable                     (implemented)
     wal/                # log writer/reader
-    memtable/
     sstable/            # builder, reader, block, index
     manifest/
     compaction/
@@ -453,7 +489,7 @@ tracedb/
     env/                # filesystem abstraction (real + fault-injecting)
   tests/
     unit/               # (implemented)
-    differential/
+    differential/       # (implemented for Put/Get)
     crash/
   bench/                # workload generator, SQLite baseline, runner
   docs/
@@ -469,7 +505,7 @@ tracedb/
 ## 13. Open Questions
 
 - **Q1.** Should payloads live inline or in a separate blob log from the start? (Inline is simpler; separation reduces compaction write amplification for large payloads.)
-- **Q2.** Memtable structure: `std::map` (simple) or a hand-written skip list (lock-free concurrent reads, needed for v2)? Leaning: `std::map` behind a small interface for v1. It must be a *balanced* tree: time-ordered inserts would degrade an unbalanced BST into a linked list.
+- **Q2.** *(Resolved for v1.)* Memtable structure: `std::map` (simple) or a hand-written skip list (lock-free concurrent reads, needed for v2)? **Decision:** `std::map` behind the `Memtable` class ([5.7](#57-memtable-implemented-srcmemtablememtableh)). Revisit with a skip list if the v2 background thread needs concurrent reads.
 - **Q3.** How much out-of-order arrival should the benchmark data have, and how does it affect L0 overlap and the cost of rewriting L1 files for late data?
 - **Q4.** Default sync mode for benchmarks: `kEveryWrite` is fair to SQLite's FULL sync, but group commit is more realistic for tracing workloads. Report both.
 - **Q5.** Is a tag index worth it in v1, or does time-range pruning plus in-range filtering make it unnecessary for realistic window sizes?
@@ -487,6 +523,16 @@ tracedb/
 ---
 
 ## Changelog
+
+**v0.3**
+- 4: the full API is a target; methods and options are added as they are implemented.
+- 4.2 (new): `TraceDB` as an abstract interface with a private `DBImpl`; `Open` as a validating factory; ownership, copying, `Close` semantics.
+- 5.1: sequence numbers start at 1; which write-path steps exist.
+- 5.7 (new): memtable design: `std::map` with `std::less<>`, encoded bytes, one version per key, views, memory accounting.
+- 8.2: differential test as built.
+- 11: M1 in progress.
+- 12: layout updated.
+- 13: Q2 resolved for v1.
 
 **v0.2**
 - 1.1: added the rationale for an LSM tree over a B-tree, with caveats.
